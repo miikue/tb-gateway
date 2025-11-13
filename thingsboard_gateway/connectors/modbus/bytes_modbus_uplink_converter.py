@@ -33,6 +33,66 @@ class BytesModbusUplinkConverter(ModbusConverter):
         self._log = logger
         self.__config = config
 
+
+    def _process_array_mapping_response(self, config, raw_response_data, append_method):
+        self._log.debug("Processing unpack array mapping response for config: %s", config)
+
+        # Determine the size of a single item in registers (1 register = 16 bits)
+        item_size = 1  # Default for 16-bit types
+        config_type = config.get('type', '').lower()
+        if '32' in config_type or config_type == 'float':  # 32-bit float is common
+            item_size = 2
+        elif '64' in config_type:
+            item_size = 4
+        elif '16' in config_type:
+            item_size = 1
+
+        registers_data = self.__get_registers_from_wide_range_encoded_data(raw_response_data, config['functionCode'])
+        base_address = Utils.get_start_address(config['address'])
+
+        for line in config["mapping"]:
+            try:
+                # Use split with maxsplit=1 to handle key names that might contain colons
+                parts = line.split(":", 1)
+                if len(parts) != 2:
+                    self._log.warning("Invalid mapping format: '%s'. Expected 'address:keyName'. Skipping.", line)
+                    continue
+
+                address = int(parts[0])
+                keyName = parts[1]
+            except ValueError:
+                self._log.warning("Invalid address format in mapping: '%s'. Cannot convert to integer. Skipping.", parts[0])
+                continue
+
+            index = address - base_address
+
+            if index < 0 or index >= len(registers_data):
+                self._log.warning("Address %d is outside the read block [%d-%d] for tag '%s'",
+                                      address, base_address, base_address + len(registers_data) - 1, keyName)
+                continue
+
+            item_decode_config = config.copy()
+            item_decode_config['objectsCount'] = item_size
+
+            chunk = registers_data[index:index + item_size]
+            if len(chunk) < item_size:
+                self._log.warning("Not enough data to unpack '%s' at address %d (index %d). Required %d registers, found %d.",
+                                    keyName, address, index, item_size, len(chunk))
+                continue
+
+            decoded_value = self.decode_data(chunk, item_decode_config, self.__config.byte_order,
+                                                self.__config.word_order)
+
+            if decoded_value is not None:
+                append_method({keyName: decoded_value})
+            else:
+                self._log.warning("Decoded value is None for '%s' at address %d", keyName, address)
+
+
+
+
+
+
     @CollectStatistics(start_stat_type='receivedBytesFromDevices',
                        end_stat_type='convertedBytesFromDevice')
     def convert(self, _, data: List[dict]) -> Union[ConvertedData, None]:
@@ -53,22 +113,32 @@ class BytesModbusUplinkConverter(ModbusConverter):
                     encoded_data = device_data[config_section].get(config['tag'])
 
                     try:
-                        if Utils.is_wide_range_request(config['address']):
-                            datapoints = self.__process_wide_range_response(config, encoded_data)
+                        # New unpack logic
+                        if isinstance(config.get('mapping'), list):
+                            self._process_array_mapping_response(config, encoded_data,
+                                                               converted_data_append_methods[config_section])
+                        # Existing logic
                         else:
-                            datapoints = self.__process_single_address_response(config, encoded_data)
+
+                            if Utils.is_wide_range_request(config['address']):
+                                datapoints = self.__process_wide_range_response(config, encoded_data)
+                            else:
+                                datapoints = self.__process_single_address_response(config, encoded_data)
+
+
+                            for datapoint in datapoints:
+                                for key_name, decoded_data in datapoint.items():
+                                    datapoint_key = TBUtility.convert_key_to_datapoint_key(key_name,
+                                                                                   device_report_strategy,
+                                                                                   config,
+                                                                                   self._log)
+                                    converted_data_append_methods[config_section]({datapoint_key: decoded_data})
+
                     except (ValueError, IndexError, TypeError) as e:
                         self._log.error("Encoded data is invalid: %s, with config: %s, error: %s",
                                         encoded_data, config, e)
                         continue
 
-                    for datapoint in datapoints:
-                        for key_name, decoded_data in datapoint.items():
-                            datapoint_key = TBUtility.convert_key_to_datapoint_key(key_name,
-                                                                                   device_report_strategy,
-                                                                                   config,
-                                                                                   self._log)
-                            converted_data_append_methods[config_section]({datapoint_key: decoded_data})
 
         self._log.trace("Decoded data: %s", result)
         StatisticsService.count_connector_message(self._log.name, 'convertersAttrProduced',
