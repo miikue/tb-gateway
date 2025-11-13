@@ -42,7 +42,7 @@ class Utils:
                 while remaining_registers > 0:
                     registers_chunk = min(16, remaining_registers)
                     result.append((current_start_address, registers_chunk))
-                    current_start_address += registers_chunk + 1
+                    current_start_address += registers_chunk
                     remaining_registers -= registers_chunk
             else:
                 result.append((start_address, registers_to_read))
