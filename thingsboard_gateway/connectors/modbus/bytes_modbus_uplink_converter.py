@@ -49,19 +49,26 @@ class BytesModbusUplinkConverter(ModbusConverter):
 
         registers_data = self.__get_registers_from_wide_range_encoded_data(raw_response_data, config['functionCode'])
         base_address = Utils.get_start_address(config['address'])
+        
+        # Track which register indices have been processed by explicit mappings
+        processed_indices = set()
 
+        # Process explicit mappings first
         for line in config["mapping"]:
             try:
                 # Use split with maxsplit=1 to handle key names that might contain colons
                 parts = line.split(":", 1)
-                if len(parts) != 2:
-                    self._log.warning("Invalid mapping format: '%s'. Expected 'address:keyName'. Skipping.", line)
-                    continue
-
                 address = int(parts[0])
-                keyName = parts[1]
-            except ValueError:
-                self._log.warning("Invalid address format in mapping: '%s'. Cannot convert to integer. Skipping.", parts[0])
+
+                if len(parts) == 2 and parts[1]:
+                    keyName = parts[1]
+                else:
+                    # No key name provided in mapping, generate a default one.
+                    keyName = f"Value_at_{address}"
+                    self._log.debug("No key name found for address %d in mapping, using default: '%s'", address, keyName)
+
+            except (ValueError, IndexError):
+                self._log.warning("Invalid mapping format or address in line: '%s'. Skipping.", line)
                 continue
 
             index = address - base_address
@@ -70,6 +77,10 @@ class BytesModbusUplinkConverter(ModbusConverter):
                 self._log.warning("Address %d is outside the read block [%d-%d] for tag '%s'",
                                       address, base_address, base_address + len(registers_data) - 1, keyName)
                 continue
+
+            # Mark indices as processed
+            for i in range(index, index + item_size):
+                processed_indices.add(i)
 
             item_decode_config = config.copy()
             item_decode_config['objectsCount'] = item_size
@@ -86,7 +97,41 @@ class BytesModbusUplinkConverter(ModbusConverter):
             if decoded_value is not None:
                 append_method({keyName: decoded_value})
             else:
-                self._log.warning("Decoded value is None for '%s' at address %d", keyName, address)
+                self._log.warning("Decoded value is None for '%s' at address %d with type '%s'", keyName, address, config_type)
+
+        # Now, process any unmapped registers
+        current_register_index = 0
+        while current_register_index < len(registers_data):
+            if current_register_index not in processed_indices:
+                # This register (and potentially subsequent ones) is unmapped
+                # We need to determine its size based on the config's type
+                unmapped_item_size = item_size # Assume same item_size as the main config type
+
+                # Check if there's enough data for an unmapped item
+                if current_register_index + unmapped_item_size <= len(registers_data):
+                    unmapped_address = base_address + current_register_index
+                    unmapped_keyName = f"Unmapped_Value_at_{unmapped_address}"
+                    self._log.debug("Processing unmapped data at address %d, generating key: '%s'", unmapped_address, unmapped_keyName)
+
+                    unmapped_decode_config = config.copy()
+                    unmapped_decode_config['objectsCount'] = unmapped_item_size
+
+                    unmapped_chunk = registers_data[current_register_index:current_register_index + unmapped_item_size]
+                    
+                    unmapped_decoded_value = self.decode_data(unmapped_chunk, unmapped_decode_config, self.__config.byte_order,
+                                                                self.__config.word_order)
+                    
+                    if unmapped_decoded_value is not None:
+                        append_method({unmapped_keyName: unmapped_decoded_value})
+                    else:
+                        self._log.warning("Decoded value is None for unmapped data at address %d with type '%s'", unmapped_address, config_type)
+                    
+                    current_register_index += unmapped_item_size
+                else:
+                    self._log.debug("Not enough data for a full unmapped item starting at index %d. Remaining data: %d registers.", current_register_index, len(registers_data) - current_register_index)
+                    current_register_index += 1 # Move to next register to avoid infinite loop
+            else:
+                current_register_index += 1 # Move to next register if already processed
 
 
 
