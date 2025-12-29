@@ -77,6 +77,9 @@ class Utils:
 
     @staticmethod
     def get_registers_from_encoded_data(encoded_data, function_code):
+        if isinstance(encoded_data, list):
+            return encoded_data
+
         if function_code in (1, 2):
             encoded_data = encoded_data.bits
         elif function_code in (3, 4):

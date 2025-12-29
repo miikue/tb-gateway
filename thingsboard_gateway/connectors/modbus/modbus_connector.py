@@ -245,6 +245,138 @@ class AsyncModbusConnector(Connector, Thread):
             except Exception as e:
                 self.__log.exception('Failed to poll device: %s', e)
 
+    def __build_read_batches(self, slave):
+        MAX_BATCH_SIZE = 50
+        batches = []
+
+        # Merge attributes and telemetry
+        all_items = []
+        for config_section in ('attributes', 'telemetry'):
+            if hasattr(slave.uplink_converter_config, config_section):
+                for item in getattr(slave.uplink_converter_config, config_section):
+                    item_copy = item.copy()
+                    item_copy['_config_section'] = config_section
+                    all_items.append(item_copy)
+
+        # Group by Function Code
+        grouped_by_fc = {}
+        for item in all_items:
+            fc = item.get('functionCode')
+            if fc not in grouped_by_fc:
+                grouped_by_fc[fc] = []
+            grouped_by_fc[fc].append(item)
+
+        # Create batches
+        for fc, items in grouped_by_fc.items():
+            # Pre-process items: Expand ranges, resolve addresses AND DEDUPLICATE
+            # Key: (start_address, count) -> Item with list of targets
+            unique_reads = {}
+            
+            for item in items:
+                addr = item.get('address')
+                # Determine size of ONE object (default 1)
+                obj_count = item.get('objectsCount', item.get('registersCount', item.get('registerCount', 1)))
+
+                try:
+                    current_items_to_process = []
+
+                    # Case 1: Range String "6-9" -> Expand into multiple items
+                    if isinstance(addr, str) and Utils.is_wide_range_request(addr):
+                        s_str, e_str = addr.split('-')
+                        start_curr = int(s_str)
+                        end_limit = int(e_str)
+                        
+                        while start_curr <= end_limit:
+                            expanded_item = item.copy()
+                            expanded_item['address'] = start_curr
+                            expanded_item['_start_address'] = start_curr
+                            expanded_item['_count'] = obj_count
+                            current_items_to_process.append(expanded_item)
+                            start_curr += obj_count
+                            
+                    # Case 2: Single Address (int or string) -> Single item
+                    else:
+                        start_addr = addr
+                        if isinstance(addr, str):
+                            if addr.lower().startswith('0x'):
+                                start_addr = int(addr, 16)
+                            elif addr.isdigit():
+                                start_addr = int(addr)
+                            else:
+                                start_addr = int(addr, 0)
+                        elif isinstance(addr, int):
+                            start_addr = addr
+                            
+                        item['_start_address'] = start_addr
+                        item['_count'] = obj_count
+                        current_items_to_process.append(item)
+
+                    # Deduplication Logic
+                    for proc_item in current_items_to_process:
+                        key = (proc_item['_start_address'], proc_item['_count'])
+                        if key not in unique_reads:
+                            # Create new entry, initialize targets list with self
+                            # We keep the item structure but add a hidden list of real targets
+                            proc_item['_targets'] = [proc_item.copy()] 
+                            unique_reads[key] = proc_item
+                        else:
+                            # Already exists, just append self to targets
+                            unique_reads[key]['_targets'].append(proc_item.copy())
+
+                except Exception as e:
+                    self.__log.error("Failed to process address '%s' for device %s: %s", addr, slave.device_name, e)
+                    continue
+
+            # Convert map back to list for sorting and batching
+            processed_items = list(unique_reads.values())
+
+            # Sort by resolved start address
+            processed_items.sort(key=lambda x: x['_start_address'])
+
+            current_batch = None
+
+            for item in processed_items:
+                start = item['_start_address']
+                count = item['_count']
+                end = start + count
+
+                if current_batch is None:
+                    current_batch = {
+                        "functionCode": fc,
+                        "address": start,
+                        "count": count,
+                        "items": [{**item, "relativeAddress": 0}]
+                    }
+                else:
+                    batch_end = current_batch['address'] + current_batch['count']
+                    
+                    # Check for strict contiguity (no gaps)
+                    is_contiguous = (start == batch_end)
+                    
+                    # Check max batch size
+                    new_total_len = (end - current_batch['address'])
+                    is_within_limit = new_total_len <= MAX_BATCH_SIZE
+
+                    if is_contiguous and is_within_limit:
+                        # Append to current batch
+                        item['relativeAddress'] = start - current_batch['address']
+                        current_batch['count'] = new_total_len
+                        current_batch['items'].append(item)
+                    else:
+                        # Finish current batch and start new one
+                        batches.append(current_batch)
+                        current_batch = {
+                            "functionCode": fc,
+                            "address": start,
+                            "count": count,
+                            "items": [{**item, "relativeAddress": 0}]
+                        }
+
+            if current_batch:
+                batches.append(current_batch)
+
+        return batches
+
     async def __poll_device(self, slave: Slave):
         self.__log.debug("Polling %s slave", slave)
 
@@ -278,11 +410,61 @@ class AsyncModbusConnector(Connector, Thread):
         else:
             self.__log.debug('Config is empty. Nothing to read, for device %s', slave)
 
+
+
+
     async def __read_slave_data(self, slave: Slave):
         result = {
             'telemetry': {},
             'attributes': {}
         }
+
+        if not hasattr(slave, 'optimized_batches'):
+            slave.optimized_batches = self.__build_read_batches(slave)
+
+        if (True == True):
+            for batch in slave.optimized_batches:
+                try:
+                    response = await slave.read(batch['functionCode'],batch['address'], batch['count'])
+
+                    full_registers = None
+                    if batch['functionCode'] in (1,2):
+                        if hasattr(response, 'bits'):
+                            full_registers = response.bits
+                    elif batch['functionCode'] in (3,4):
+                        if hasattr(response, 'bits'):
+                            full_registers = response.registers
+
+                    if not full_registers:
+                        continue
+                    
+                    for item in batch['items']:
+                        # item is now a representative for possibly multiple targets
+                        # We must iterate over all targets (including the original one)
+                        
+                        rel_addr = item['relativeAddress']
+                        count = item.get('objectsCount', item.get('registersCount', item.get('registerCount', 1)))
+                        chunk = full_registers[rel_addr : rel_addr + count]
+                        
+                        targets = item.get('_targets', [item]) # Fallback for backward compat if needed
+                        
+                        for target in targets:
+                            tag = target['tag']
+                            section = target['_config_section']
+                            
+                            if result[section].get(tag) is None:
+                                result[section][tag] = []
+                            result[section][tag].append(chunk)
+ 
+                except asyncio.exceptions.TimeoutError:
+                    self.__log.error("Timeout reading batch FC:%s Adr:%s Count:%s for device %s", batch['functionCode'], batch['address'], batch['count'], slave.device_name)
+                    continue
+                except Exception as e:
+                    self.__log.exception("Error processing batch for device %s: %s", slave.device_name, e)
+                    continue 
+            return result                    
+
+
 
         for config_section in ('attributes', 'telemetry'):
             for config in getattr(slave.uplink_converter_config, config_section):
