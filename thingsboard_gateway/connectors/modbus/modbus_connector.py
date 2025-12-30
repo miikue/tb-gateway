@@ -389,7 +389,10 @@ class AsyncModbusConnector(Connector, Thread):
                     self.__manage_device_connectivity_to_platform(slave)
 
                 if connected_to_master:
-                    slave_data = await self.__read_slave_data(slave)
+                    if getattr(slave, 'batch_size', 1) > 1:
+                        slave_data = await self.__read_slave_data_batched(slave)
+                    else:
+                        slave_data = await self.__read_slave_data(slave)
 
                     if not self.__is_read_data_empty(slave_data):
                         self.__data_to_convert.put_nowait((slave, slave_data))
@@ -410,62 +413,56 @@ class AsyncModbusConnector(Connector, Thread):
         else:
             self.__log.debug('Config is empty. Nothing to read, for device %s', slave)
 
+    async def __read_slave_data_batched(self, slave: Slave):
+        if not hasattr(slave, 'optimized_batches'):
+            slave.optimized_batches = self.__build_read_batches(slave)
 
+        try:
+            result = {
+                'telemetry': {},
+                'attributes': {}
+            }
+            for batch in slave.optimized_batches:
+                response = await slave.read(batch['functionCode'], batch['address'], batch['count'])
 
+                full_registers = None
+                if batch['functionCode'] in (1, 2):
+                    if hasattr(response, 'bits'):
+                        full_registers = response.bits
+                elif batch['functionCode'] in (3, 4):
+                    if hasattr(response, 'registers'):
+                        full_registers = response.registers
+
+                if not full_registers:
+                    continue
+
+                for item in batch['items']:
+                    rel_addr = item['relativeAddress']
+                    count = item.get('objectsCount', item.get('registersCount', item.get('registerCount', 1)))
+                    chunk = full_registers[rel_addr: rel_addr + count]
+
+                    targets = item.get('_targets', [item])  # Fallback for backward compat if needed
+
+                    for target in targets:
+                        tag = target['tag']
+                        section = target['_config_section']
+
+                        if result[section].get(tag) is None:
+                            result[section][tag] = []
+                        result[section][tag].append(chunk)
+            return result
+        except Exception as e:
+            self.__log.warning("Optimized read failed for device %s, falling back to sequential read. Error: %s",
+                               slave.device_name, e)
+            self.__log.debug("Optimized read error stack:", exc_info=e)
+
+            return await self.__read_slave_data(slave)
 
     async def __read_slave_data(self, slave: Slave):
         result = {
             'telemetry': {},
             'attributes': {}
         }
-
-        if not hasattr(slave, 'optimized_batches'):
-            slave.optimized_batches = self.__build_read_batches(slave)
-
-        if (True == True):
-            for batch in slave.optimized_batches:
-                try:
-                    response = await slave.read(batch['functionCode'],batch['address'], batch['count'])
-
-                    full_registers = None
-                    if batch['functionCode'] in (1,2):
-                        if hasattr(response, 'bits'):
-                            full_registers = response.bits
-                    elif batch['functionCode'] in (3,4):
-                        if hasattr(response, 'bits'):
-                            full_registers = response.registers
-
-                    if not full_registers:
-                        continue
-                    
-                    for item in batch['items']:
-                        # item is now a representative for possibly multiple targets
-                        # We must iterate over all targets (including the original one)
-                        
-                        rel_addr = item['relativeAddress']
-                        count = item.get('objectsCount', item.get('registersCount', item.get('registerCount', 1)))
-                        chunk = full_registers[rel_addr : rel_addr + count]
-                        
-                        targets = item.get('_targets', [item]) # Fallback for backward compat if needed
-                        
-                        for target in targets:
-                            tag = target['tag']
-                            section = target['_config_section']
-                            
-                            if result[section].get(tag) is None:
-                                result[section][tag] = []
-                            result[section][tag].append(chunk)
- 
-                except asyncio.exceptions.TimeoutError:
-                    self.__log.error("Timeout reading batch FC:%s Adr:%s Count:%s for device %s", batch['functionCode'], batch['address'], batch['count'], slave.device_name)
-                    continue
-                except Exception as e:
-                    self.__log.exception("Error processing batch for device %s: %s", slave.device_name, e)
-                    continue 
-            return result                    
-
-
-
         for config_section in ('attributes', 'telemetry'):
             for config in getattr(slave.uplink_converter_config, config_section):
                 try:

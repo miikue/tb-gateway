@@ -105,6 +105,8 @@ class Slave:
         self.connection_attempt = config.get(CONNECT_ATTEMPT_COUNT_PARAMETER, 2) \
             if config.get(CONNECT_ATTEMPT_COUNT_PARAMETER, 2) >= 2 else 2
 
+        self.batch_size = config.get('batchSize', 50)
+
         self.__delay_between_requests_ms = config.get(DELAY_BETWEEN_REQUESTS_MS_PARAMETER, 0)
 
         self.device_name = config[DEVICE_NAME_PARAMETER]
