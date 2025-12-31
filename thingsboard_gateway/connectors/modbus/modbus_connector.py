@@ -246,7 +246,6 @@ class AsyncModbusConnector(Connector, Thread):
                 self.__log.exception('Failed to poll device: %s', e)
 
     def __build_read_batches(self, slave):
-        MAX_BATCH_SIZE = 50
         batches = []
 
         # Merge attributes and telemetry
@@ -268,6 +267,11 @@ class AsyncModbusConnector(Connector, Thread):
 
         # Create batches
         for fc, items in grouped_by_fc.items():
+            if fc in (1, 2):
+                max_batch_size = min(getattr(slave, 'batch_size', 1), 2000)
+            else:
+                max_batch_size = min(getattr(slave, 'batch_size', 1), 125)
+
             # Pre-process items: Expand ranges, resolve addresses AND DEDUPLICATE
             # Key: (start_address, count) -> Item with list of targets
             unique_reads = {}
@@ -355,7 +359,7 @@ class AsyncModbusConnector(Connector, Thread):
                     
                     # Check max batch size
                     new_total_len = (end - current_batch['address'])
-                    is_within_limit = new_total_len <= MAX_BATCH_SIZE
+                    is_within_limit = new_total_len <= max_batch_size
 
                     if is_contiguous and is_within_limit:
                         # Append to current batch
